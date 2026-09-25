@@ -55,6 +55,34 @@ export interface TranscriptTrack {
   segments: Segment[];
 }
 
+export interface ShiftChange {
+  segmentId: string;
+  kind: "modified" | "added" | "removed";
+  before: Segment | null;
+  after: Segment | null;
+  summary: string[];
+}
+
+export interface ShiftRecord {
+  id: string;
+  reviewer: string;
+  trackId: string;
+  trackName: string;
+  startedAt: string;
+  endedAt: string;
+  changes: ShiftChange[];
+}
+
+export interface ActiveShift {
+  id: string;
+  reviewer: string;
+  trackId: string;
+  trackName: string;
+  startedAt: string;
+  tabId: string;
+  snapshot: Segment[];
+}
+
 export interface ProjectData {
   id: string;
   title: string;
@@ -64,6 +92,7 @@ export interface ProjectData {
   speakers: Speaker[];
   tags: Tag[];
   tracks: TranscriptTrack[];
+  history: ShiftRecord[];
   updatedAt: string;
 }
 

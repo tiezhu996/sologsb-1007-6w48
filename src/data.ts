@@ -188,6 +188,7 @@ export const createSeedProject = (): ProjectData => {
         ],
       },
     ],
+    history: [],
     updatedAt: new Date().toISOString(),
   };
 };

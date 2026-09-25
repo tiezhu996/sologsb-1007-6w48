@@ -1,8 +1,9 @@
 import { createSeedProject } from "./data";
-import type { PersistedEnvelope, ProjectData } from "./types";
+import type { ActiveShift, PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
+export const SHIFT_KEY = "sologsb-1007-shift-v1";
 
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
@@ -11,12 +12,35 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
+      // Older drafts predate the shift history field.
+      if (!Array.isArray(parsed.project.history)) parsed.project.history = [];
       return { project: parsed.project, revision: parsed.revision ?? 0 };
     }
   } catch {
     // A malformed local draft falls back to the bundled sample.
   }
   return { project: createSeedProject(), revision: 0 };
+}
+
+export function loadActiveShift(tabId: string): ActiveShift | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SHIFT_KEY) ?? "") as ActiveShift;
+    // Only the tab that opened the shift resumes it, so a refresh keeps the
+    // shift alive without leaking it into a second tab.
+    if (parsed?.tabId === tabId && Array.isArray(parsed.snapshot)) return parsed;
+  } catch {
+    // Ignore malformed shift state.
+  }
+  return null;
+}
+
+export function saveActiveShift(shift: ActiveShift) {
+  localStorage.setItem(SHIFT_KEY, JSON.stringify(shift));
+}
+
+export function clearActiveShift() {
+  localStorage.removeItem(SHIFT_KEY);
 }
 
 export function saveProject(project: ProjectData, revision: number, tabId: string) {
