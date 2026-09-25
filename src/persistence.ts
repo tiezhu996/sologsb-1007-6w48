@@ -19,13 +19,19 @@ export function loadProject(): { project: ProjectData; revision: number } {
   return { project: createSeedProject(), revision: 0 };
 }
 
-export function saveProject(project: ProjectData, revision: number, tabId: string) {
+export function saveProject(
+  project: ProjectData,
+  revision: number,
+  tabId: string,
+  shiftEnd?: PersistedEnvelope["shiftEnd"],
+) {
   const envelope: PersistedEnvelope = {
     schema: 1,
     revision,
     tabId,
     savedAt: Date.now(),
     project,
+    shiftEnd,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
   return envelope;

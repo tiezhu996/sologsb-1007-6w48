@@ -1,6 +1,7 @@
 import { Checkbox } from "@kobalte/core/checkbox";
 import { Dialog } from "@kobalte/core/dialog";
 import { Tabs } from "@kobalte/core/tabs";
+import { A } from "@solidjs/router";
 import {
   For,
   Show,
@@ -14,7 +15,29 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import {
+  appendShiftHistory,
+  computeShiftChanges,
+  downloadHandoff,
+  formatDateTime,
+  lastProofreader,
+  loadActiveShift,
+  persistActiveShift,
+  saveLastProofreader,
+  shiftDuration,
+  startShift as beginShift,
+} from "../shift";
+import type {
+  Confidence,
+  PersistedEnvelope,
+  ProjectData,
+  ReviewShift,
+  Segment,
+  ShiftChange,
+  ShiftEndNotice,
+  ShiftSyncMessage,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
@@ -115,6 +138,19 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [activeShift, setActiveShift] = createSignal<ReviewShift | null>(loadActiveShift());
+  const [startOpen, setStartOpen] = createSignal(false);
+  const [endOpen, setEndOpen] = createSignal(false);
+  const [proofreaderDraft, setProofreaderDraft] = createSignal(lastProofreader());
+  const [handoffNote, setHandoffNote] = createSignal("");
+  const [closedSummary, setClosedSummary] = createSignal<ReviewShift | null>(null);
+  const [shiftConflict, setShiftConflict] = createSignal<ShiftEndNotice | null>(null);
+  const [restoreHint, setRestoreHint] = createSignal(
+    (() => {
+      const restored = typeof localStorage !== "undefined" ? loadActiveShift() : null;
+      return restored ? `已恢复 ${restored.proofreader} 未结束的校订班次（${restored.trackName}）` : "";
+    })(),
+  );
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -141,6 +177,96 @@ export default function OralHistoryEditor() {
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+
+  const shiftTrack = createMemo(() => {
+    const shift = activeShift();
+    if (!shift) return null;
+    return project().tracks.find((track) => track.id === shift.trackId) ?? null;
+  });
+  const shiftChanges = createMemo<ShiftChange[]>(() => {
+    const shift = activeShift();
+    if (!shift) return [];
+    // Recompute whenever the project changes so the end-shift review is live.
+    project();
+    return computeShiftChanges(shift, untrack(project));
+  });
+  const changedSegmentIds = createMemo(() => {
+    const ids = new Set<string>();
+    for (const change of shiftChanges()) ids.add(change.segmentId);
+    return ids;
+  });
+  const shiftCommentAuthor = () => activeShift()?.proofreader?.trim() || "当前校对员";
+
+  const openStartDialog = () => {
+    setProofreaderDraft(lastProofreader());
+    setStartOpen(true);
+  };
+
+  const confirmStartShift = () => {
+    const name = proofreaderDraft().trim();
+    if (!name) return;
+    const track = activeTrack();
+    if (!track) return;
+    const shift = beginShift(track, name, project().title);
+    saveLastProofreader(name);
+    persistActiveShift(shift);
+    setActiveShift(shift);
+    setStartOpen(false);
+    setRestoreHint("");
+    setLastAction(`班次已开始：${name} · ${track.name}`);
+    channel?.postMessage({ kind: "shift-started", tabId: TAB_ID, savedAt: Date.now(), shift } satisfies ShiftSyncMessage);
+  };
+
+  const endShift = () => {
+    const shift = activeShift();
+    if (!shift) return;
+    setHandoffNote("");
+    setEndOpen(true);
+  };
+
+  const confirmEndShift = () => {
+    const shift = activeShift();
+    if (!shift) return;
+    const changes = computeShiftChanges(shift, project());
+    const closed: ReviewShift = {
+      ...shift,
+      active: false,
+      endedAt: new Date().toISOString(),
+      lastSeenAt: shift.lastSeenAt ?? new Date().toISOString(),
+      changes,
+      changeCount: changes.length,
+      handoffNote: handoffNote().trim() || undefined,
+    };
+    appendShiftHistory(closed);
+    persistActiveShift(null);
+    setActiveShift(null);
+    setEndOpen(false);
+    setClosedSummary(closed);
+    setLastAction(`班次已结束：${closed.proofreader} 改动 ${changes.length} 个片段，已写入项目历史`);
+    // Flush the current project (tagged with the shift) so the other tab can
+    // load exactly what this shift saw and tell the two conflicts apart.
+    const nextRevision = revision() + 1;
+    setRevision(nextRevision);
+    const envelope = saveProject(project(), nextRevision, TAB_ID, {
+      id: closed.id,
+      proofreader: closed.proofreader,
+      trackName: closed.trackName,
+      changeCount: closed.changeCount ?? 0,
+    });
+    dirty = false;
+    channel?.postMessage({
+      kind: "shift-ended",
+      tabId: TAB_ID,
+      savedAt: Date.now(),
+      shift: closed,
+      envelope,
+    } satisfies ShiftSyncMessage);
+  };
+
+  const exportClosedHandoff = () => {
+    const summary = closedSummary();
+    if (summary) downloadHandoff(summary, project());
+  };
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -279,7 +405,7 @@ export default function OralHistoryEditor() {
     commitSegment("添加批注", (segment) => {
       segment.comments.unshift({
         id: uid("comment"),
-        author: "当前校对员",
+        author: shiftCommentAuthor(),
         body,
         createdAt: new Date().toISOString(),
         resolved: false,
@@ -297,7 +423,7 @@ export default function OralHistoryEditor() {
       const comment = segment.comments.find((item) => item.id === commentId);
       comment?.replies.push({
         id: uid("reply"),
-        author: "当前校对员",
+        author: shiftCommentAuthor(),
         body,
         createdAt: new Date().toISOString(),
       });
@@ -361,17 +487,77 @@ export default function OralHistoryEditor() {
     setConflict(null);
   };
 
+  // Another tab ended its shift while this page still has that shift open.
+  const resolveShiftConflict = (loadIncoming: boolean) => {
+    const notice = shiftConflict();
+    if (!notice) return;
+    const envelope = notice.envelope;
+    if (loadIncoming && envelope) {
+      setPast((items) => [...items.slice(-49), structuredClone(project())]);
+      setProject(structuredClone(envelope.project));
+      setRevision(envelope.revision + 1);
+      setActiveShift(null);
+      persistActiveShift(null);
+      setSelectedId(envelope.project.tracks.find((track) => track.id === envelope.project.activeTrackId)?.segments[0]?.id ?? "");
+      setLastAction(`已载入 ${notice.proofreader} 结束班次时的内容`);
+      dirty = true;
+    } else {
+      // Keep this page's edits: continue the same handoff under our own tab.
+      const resumed = untrack(activeShift);
+      if (resumed) {
+        const nextShift: ReviewShift = { ...resumed, lastSeenAt: new Date().toISOString() };
+        persistActiveShift(nextShift);
+        setActiveShift(nextShift);
+      }
+      setRevision((value) => value + 1);
+      setLastAction("已保留本页校对内容，班次继续");
+      dirty = true;
+    }
+    setShiftConflict(null);
+  };
+
   onMount(() => {
     hydrated = true;
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
-      try {
-        const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
-        if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
-      } catch {
-        // Ignore unrelated or malformed storage events.
+      if (!event.newValue) return;
+      if (event.key === "sologsb-1007-project-v1") {
+        try {
+          const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
+          if (incoming.tabId === TAB_ID || incoming.revision <= revision()) return;
+          // A save that finalized our own shift becomes a handoff conflict,
+          // not a generic draft conflict.
+          if (incoming.shiftEnd && incoming.shiftEnd.id === untrack(activeShift)?.id) {
+            setShiftConflict({
+              tabId: incoming.tabId,
+              savedAt: incoming.savedAt,
+              shiftId: incoming.shiftEnd.id,
+              proofreader: incoming.shiftEnd.proofreader,
+              trackName: incoming.shiftEnd.trackName,
+              changeCount: incoming.shiftEnd.changeCount,
+              envelope: incoming,
+            });
+            return;
+          }
+          setConflict(incoming);
+        } catch {
+          // Ignore unrelated or malformed storage events.
+        }
+        return;
+      }
+      // BroadcastChannel is unavailable in some private modes; storage events
+      // keep shift handoff notifications working as a fallback.
+      if (event.key === "sologsb-1007-active-shift-v1") {
+        try {
+          const shift = JSON.parse(event.newValue) as ReviewShift;
+          if (shift?.id && shift.active && shift.id !== untrack(activeShift)?.id) {
+            setActiveShift(shift);
+            setLastAction(`另一标签页已开始 ${shift.proofreader} 的校订班次`);
+          }
+        } catch {
+          // Malformed shift payload.
+        }
       }
     };
     const handleKeydown = (event: KeyboardEvent) => {
@@ -422,8 +608,51 @@ export default function OralHistoryEditor() {
     });
   });
 
-  channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
-    if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
+  channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope | ShiftSyncMessage>) => {
+    const data = event.data;
+    if (!data || data.tabId === TAB_ID) return;
+    if ((data as ShiftSyncMessage).kind === "shift-started") {
+      const message = data as ShiftSyncMessage;
+      if (message.shift.id !== untrack(activeShift)?.id) {
+        setActiveShift(message.shift);
+        persistActiveShift(message.shift);
+        setRestoreHint("");
+        setLastAction(`另一标签页已开始 ${message.shift.proofreader} 的校订班次`);
+      }
+      return;
+    }
+    if ((data as ShiftSyncMessage).kind === "shift-ended") {
+      const message = data as ShiftSyncMessage;
+      const current = untrack(activeShift);
+      // Only raise a handoff conflict when this page is still on that shift.
+      if (current?.id === message.shift.id) {
+        setShiftConflict({
+          tabId: message.tabId,
+          savedAt: message.savedAt,
+          shiftId: message.shift.id,
+          proofreader: message.shift.proofreader,
+          trackName: message.shift.trackName,
+          changeCount: message.shift.changeCount ?? message.shift.changes?.length ?? 0,
+          envelope: message.envelope,
+        });
+      }
+      return;
+    }
+    const envelope = data as PersistedEnvelope;
+    if (envelope.revision <= revision()) return;
+    if (envelope.shiftEnd && envelope.shiftEnd.id === untrack(activeShift)?.id) {
+      setShiftConflict({
+        tabId: envelope.tabId,
+        savedAt: envelope.savedAt,
+        shiftId: envelope.shiftEnd.id,
+        proofreader: envelope.shiftEnd.proofreader,
+        trackName: envelope.shiftEnd.trackName,
+        changeCount: envelope.shiftEnd.changeCount,
+        envelope,
+      });
+      return;
+    }
+    setConflict(envelope);
   });
 
   createEffect(() => {
@@ -434,6 +663,12 @@ export default function OralHistoryEditor() {
     window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
       const envelope = saveProject(current, currentRevision, TAB_ID);
+      const shift = untrack(activeShift);
+      if (shift) {
+        const touched: ReviewShift = { ...shift, lastSeenAt: new Date().toISOString() };
+        setActiveShift(touched);
+        persistActiveShift(touched);
+      }
       setSaveStatus(online() ? "saved" : "offline");
       if (dirty) {
         channel?.postMessage(envelope);
@@ -471,6 +706,31 @@ export default function OralHistoryEditor() {
         )}
       </Show>
 
+      <Show when={shiftConflict()}>
+        {(notice) => (
+          <div class="conflict-banner shift-conflict" role="alert">
+            <div>
+              <strong>{notice().proofreader} 已在另一标签页结束「{notice().trackName}」班次</strong>
+              <span>
+                改动 {notice().changeCount} 个片段并写入了项目历史。本页仍在该班次中，请选择保留本页继续校对，或载入对方的交接内容。
+              </span>
+            </div>
+            <div class="conflict-actions">
+              <button class="btn btn-quiet" onClick={() => resolveShiftConflict(false)}>保留本页</button>
+              <button class="btn btn-danger" onClick={() => resolveShiftConflict(true)}>载入对方内容</button>
+            </div>
+          </div>
+        )}
+      </Show>
+
+      <Show when={restoreHint()}>
+        {(hint) => (
+          <button class="restore-banner" onClick={() => setRestoreHint("")} title="点击关闭">
+            ↻ {hint()}（改动已自动保存）
+          </button>
+        )}
+      </Show>
+
       <header class="topbar">
         <div class="brand-mark" aria-hidden="true"><span>口述</span><b>1007</b></div>
         <div class="project-heading">
@@ -487,6 +747,14 @@ export default function OralHistoryEditor() {
         </div>
         <div class="top-actions">
           <span class={`network-chip ${online() ? "online" : "offline"}`}>{online() ? "在线" : "离线可编辑"}</span>
+          <Show when={activeShift()}>
+            {(shift) => (
+              <span class="shift-chip" title={`班次轨道：${shift().trackName}`}>
+                <i />{shift().proofreader} · {shift().trackName} · {shiftChanges().length} 段
+              </span>
+            )}
+          </Show>
+          <A class="btn btn-quiet" href="/history">校订历史</A>
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
@@ -496,6 +764,41 @@ export default function OralHistoryEditor() {
 
       <div class="workspace">
         <aside class="left-panel">
+          <section class="panel-section shift-card">
+            <div class="eyebrow">校订班次</div>
+            <Show
+              when={activeShift()}
+              fallback={
+                <>
+                  <h2>当前没有进行中的班次</h2>
+                  <p>开始前登记校订人，本班次的校对改动都会挂在本人名下，并冻结轨道快照用于交接。</p>
+                  <button class="wide-action shift-start" onClick={openStartDialog}><span>◷</span> 开始校订班次</button>
+                </>
+              }
+            >
+              {(shift) => (
+                <>
+                  <div class="shift-who">
+                    <b>{shift().proofreader}</b>
+                    <span class="shift-live"><i />班次进行中</span>
+                  </div>
+                  <dl class="shift-meta">
+                    <div><dt>轨道</dt><dd>{shift().trackName}</dd></div>
+                    <div><dt>开始</dt><dd>{formatDateTime(shift().startedAt)}</dd></div>
+                    <div><dt>时长</dt><dd>{shiftDuration(shift())}</dd></div>
+                    <div><dt>已改片段</dt><dd class="emphasis">{shiftChanges().length} 个</dd></div>
+                  </dl>
+                  <Show when={shiftTrack() && shiftTrack()!.id !== project().activeTrackId}>
+                    <button class="shift-jump" onClick={() => switchTrack(shift().trackId)}>
+                      本班次绑定「{shift().trackName}」，点击切回该轨道 →
+                    </button>
+                  </Show>
+                  <button class="wide-action shift-end" onClick={endShift}>结束班次并核对改动</button>
+                </>
+              )}
+            </Show>
+          </section>
+
           <section class="panel-section overview-card">
             <div class="eyebrow">校对进度</div>
             <div class="progress-row">
@@ -565,7 +868,7 @@ export default function OralHistoryEditor() {
                   id={`segment-${segment.id}`}
                   role="option"
                   aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
+                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""} ${changedSegmentIds().has(segment.id) ? "shift-touched" : ""}`}
                   onClick={() => clickSegment(segment.id)}
                 >
                   <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
@@ -581,6 +884,9 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={activeShift() && changedSegmentIds().has(segment.id)}>
+                        <span class="pill shift-pill">本班改 · {activeShift()!.proofreader}</span>
+                      </Show>
                     </div>
                     <p>{segment.text}</p>
                     <div class="segment-tags">
@@ -723,8 +1029,123 @@ export default function OralHistoryEditor() {
       <footer class="statusbar">
         <span>最近操作：{lastAction()}</span>
         <span>版本 {revision() + 1} · 本地草稿</span>
-        <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
+        <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助{activeShift() ? `　班次：${activeShift()!.proofreader}` : ""}</span>
       </footer>
+
+      <Dialog open={startOpen()} onOpenChange={setStartOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content shift-dialog">
+            <Dialog.Title>开始校订班次</Dialog.Title>
+            <Dialog.Description>登记校订人并冻结「{activeTrack()?.name}」当前快照；本班次对该轨道的改动都会挂在本人名下。</Dialog.Description>
+            <label class="field-label" for="proofreader-input">校订人姓名</label>
+            <input
+              id="proofreader-input"
+              class="dialog-input"
+              placeholder="例如：陈校对"
+              value={proofreaderDraft()}
+              onInput={(event) => setProofreaderDraft(event.currentTarget.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") confirmStartShift(); }}
+            />
+            <div class="shift-snapshot-note">
+              <div><span>校订轨道</span><b>{activeTrack()?.name}</b></div>
+              <div><span>快照片段</span><b>{activeTrack()?.segments.length ?? 0} 个</b></div>
+              <div><span>开始时间</span><b>{new Date().toLocaleString()}</b></div>
+            </div>
+            <p class="shift-warn">未结束的班次会随草稿保留，刷新、断网或关闭页面后再次打开仍可继续。</p>
+            <div class="dialog-footer">
+              <button class="btn btn-quiet" onClick={() => setStartOpen(false)}>取消</button>
+              <button class="btn btn-primary" disabled={!proofreaderDraft().trim()} onClick={confirmStartShift}>登记并开始</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={endOpen()} onOpenChange={setEndOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content shift-review-dialog">
+            <Show when={activeShift()}>
+              {(shift) => (
+                <>
+                  <Dialog.Title>结束班次 · 核对本人改动</Dialog.Title>
+                  <Dialog.Description>
+                    {shift().proofreader} · {shift().trackName} · {formatDateTime(shift().startedAt)} 起 · 时长 {shiftDuration(shift())}
+                  </Dialog.Description>
+                  <div class="shift-change-list">
+                    <For each={shiftChanges()} fallback={<div class="mini-empty">本班次尚未改动任何片段；仍可结束并留档。</div>}>
+                      {(change) => (
+                        <article class={`change-card change-${change.status}`}>
+                          <header>
+                            <strong>片段 {change.ordinal}</strong>
+                            <span class={`change-status ${change.status}`}>
+                              {change.status === "added" ? "新增" : change.status === "removed" ? "删除/合并" : "修改"}
+                            </span>
+                            <small>{change.text}</small>
+                          </header>
+                          <For each={change.details}>
+                            {(detail) => (
+                              <div class="change-detail">
+                                <b>{detail.label}</b>
+                                <p class="old"><span>旧</span>{detail.before || "（空）"}</p>
+                                <p class="new"><span>新</span>{detail.after || "（空）"}</p>
+                              </div>
+                            )}
+                          </For>
+                        </article>
+                      )}
+                    </For>
+                  </div>
+                  <label class="field-label" for="handoff-note">交接备注（可留给下一位校订人）</label>
+                  <textarea
+                    id="handoff-note"
+                    class="dialog-input"
+                    rows="3"
+                    placeholder="例如：seg-3 的“宁绍帮”待与录音复核…"
+                    value={handoffNote()}
+                    onInput={(event) => setHandoffNote(event.currentTarget.value)}
+                  />
+                  <div class="dialog-footer">
+                    <button class="btn btn-quiet" onClick={() => setEndOpen(false)}>继续校对</button>
+                    <button class="btn btn-primary" onClick={confirmEndShift}>
+                      确认结束并写入项目历史（{shiftChanges().length} 个片段）
+                    </button>
+                  </div>
+                </>
+              )}
+            </Show>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={!!closedSummary()} onOpenChange={(open) => !open && setClosedSummary(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content shift-dialog">
+            <Show when={closedSummary()}>
+              {(summary) => (
+                <>
+                  <Dialog.Title>班次已结束并写入历史 ✓</Dialog.Title>
+                  <Dialog.Description>
+                    {summary().proofreader} · {summary().trackName} · 共改动 {summary().changeCount ?? 0} 个片段
+                  </Dialog.Description>
+                  <p class="shift-warn">交接单可现在导出，也可之后在「校订历史」页按轨道或校订人找到本班次再导出。</p>
+                  <div class="shift-snapshot-note">
+                    <div><span>开始</span><b>{formatDateTime(summary().startedAt)}</b></div>
+                    <div><span>结束</span><b>{formatDateTime(summary().endedAt)}</b></div>
+                    <div><span>时长</span><b>{shiftDuration(summary())}</b></div>
+                  </div>
+                  <div class="dialog-footer">
+                    <A class="btn btn-quiet" href="/history" onClick={() => setClosedSummary(null)}>查看校订历史</A>
+                    <button class="btn btn-primary" onClick={exportClosedHandoff}>导出交接单 (.txt)</button>
+                    <button class="btn btn-quiet" onClick={() => setClosedSummary(null)}>完成</button>
+                  </div>
+                </>
+              )}
+            </Show>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>
